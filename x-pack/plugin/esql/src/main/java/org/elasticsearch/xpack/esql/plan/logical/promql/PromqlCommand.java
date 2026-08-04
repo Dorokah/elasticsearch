@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.capabilities.TelemetryAware;
 import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.QlIllegalArgumentException;
@@ -16,6 +17,7 @@ import org.elasticsearch.xpack.esql.core.expression.AttributeSet;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
@@ -30,6 +32,7 @@ import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
 import org.elasticsearch.xpack.esql.plan.logical.Fork;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryArithmetic;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryComparison;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
@@ -500,23 +503,28 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                             );
                         }
                     });
-                    if (binaryOperator.match() != VectorMatch.NONE) {
-                        failures.add(
-                            fail(
-                                lp,
-                                "{} queries with group modifiers are not supported at this time [{}]",
-                                lp.getClass().getSimpleName(),
-                                lp.sourceText()
-                            )
-                        );
+                    if (binaryOperator instanceof VectorBinarySet == false
+                        && binaryOperator.match() != VectorMatch.NONE
+                        && EsqlCapabilities.Cap.PROMQL_VECTOR_MATCHING_V0.isEnabled() == false) {
+                        failures.add(fail(lp, "PromQL vector matching is not enabled in this build [{}]", lp.sourceText()));
+                        return;
+                    }
+                    if (binaryOperator.match() != VectorMatch.NONE
+                        && (binaryOperator instanceof VectorBinaryArithmetic || binaryOperator instanceof VectorBinaryComparison)) {
+                        if (PromqlPlan.returnsScalar(binaryOperator.left()) || PromqlPlan.returnsScalar(binaryOperator.right())) {
+                            failures.add(fail(lp, "vector matching only allowed between instant vectors [{}]", lp.sourceText()));
+                        } else if (hasConcreteLabels(binaryOperator.left()) == false
+                            || hasConcreteLabels(binaryOperator.right()) == false) {
+                                failures.add(fail(lp, "vector matching requires operands with concrete label sets [{}]", lp.sourceText()));
+                            }
                     }
                     if (binaryOperator instanceof VectorBinaryComparison comp) {
-                        if (root.get() == false) {
+                        if (comp.match() == VectorMatch.NONE && root.get() == false) {
                             failures.add(
                                 fail(lp, "comparison operators are only supported at the top-level at this time [{}]", lp.sourceText())
                             );
                         }
-                        if (comp.right() instanceof LiteralSelector == false) {
+                        if (comp.match() == VectorMatch.NONE && comp.right() instanceof LiteralSelector == false) {
                             failures.add(
                                 fail(
                                     lp,
@@ -532,7 +540,9 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     if (binaryOperator instanceof VectorBinarySet setOp) {
                         verifySetOperator(failures, setOp, topLevelUnions.contains(setOp));
                     }
-                    if (usesWithoutGrouping(binaryOperator.left()) || usesWithoutGrouping(binaryOperator.right())) {
+                    boolean labelMatched = binaryOperator.match().filter() != VectorMatch.Filter.NONE;
+                    if (labelMatched == false
+                        && (usesWithoutGrouping(binaryOperator.left()) || usesWithoutGrouping(binaryOperator.right()))) {
                         failures.add(fail(lp, "binary expressions with WITHOUT are not supported at this time [{}]", lp.sourceText()));
                     }
                     if (hasSourceBackedExpression(binaryOperator.left())
@@ -588,7 +598,9 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
             failures.add(fail(setOp, "set operator [{}] is not supported at this time [{}]", setOp.op().keyword(), setOp.sourceText()));
             return;
         }
-        if (isTopLevelUnion == false) {
+        if (setOp.match() != VectorMatch.NONE) {
+            failures.add(fail(setOp, "set operator [or] with on/ignoring is not supported at this time [{}]", setOp.sourceText()));
+        } else if (isTopLevelUnion == false) {
             failures.add(fail(setOp, "set operator [or] is only supported at the top-level at this time [{}]", setOp.sourceText()));
         }
     }
@@ -623,6 +635,10 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
 
     private static boolean usesWithoutGrouping(LogicalPlan plan) {
         return plan.anyMatch(p -> p instanceof AcrossSeriesAggregate agg && agg.grouping() == AcrossSeriesAggregate.Grouping.WITHOUT);
+    }
+
+    private static boolean hasConcreteLabels(LogicalPlan plan) {
+        return plan.output().stream().noneMatch(attribute -> MetadataAttribute.isTimeSeriesAttributeName(attribute.name()));
     }
 
     /**

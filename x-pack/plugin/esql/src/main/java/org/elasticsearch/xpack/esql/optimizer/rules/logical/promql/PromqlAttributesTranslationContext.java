@@ -119,7 +119,7 @@ public final class PromqlAttributesTranslationContext {
             if (tc == null) {
                 return this;
             }
-            TimeSeriesColumn required = TimeSeriesColumn.of(tc.exclusions());
+            TimeSeriesColumn required = tc;
             if (groupByTimeSeries() != null) {
                 return including(required);
             }
@@ -231,11 +231,15 @@ public final class PromqlAttributesTranslationContext {
             return groupByTimeSeries() != null;
         }
 
+        TimeSeriesColumn timeSeriesGrouping() {
+            return groupByTimeSeries();
+        }
+
         private TimeSeriesColumn groupByTimeSeries() {
             return groupBy.size() == 1 && groupBy.getFirst() instanceof TimeSeriesColumn timeSeries ? timeSeries : null;
         }
 
-        private TimeSeriesColumn timeSeries(List<Attribute> exclusions) {
+        TimeSeriesColumn timeSeries(List<Attribute> exclusions) {
             for (Column column : columns) {
                 if (column instanceof TimeSeriesColumn timeSeries) {
                     List<Attribute> left = timeSeries.exclusions();
