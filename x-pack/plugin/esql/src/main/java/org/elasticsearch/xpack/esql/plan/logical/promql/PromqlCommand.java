@@ -515,6 +515,8 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                             failures.add(fail(lp, "vector matching only allowed between instant vectors [{}]", lp.sourceText()));
                         } else if (hasConcreteLabels(binaryOperator.left()) == false
                             || hasConcreteLabels(binaryOperator.right()) == false) {
+                                // TODO: Materialize match keys from runtime-defined labels.
+                                // https://github.com/elastic/elasticsearch/issues/157669
                                 failures.add(fail(lp, "vector matching requires operands with concrete label sets [{}]", lp.sourceText()));
                             }
                     }
