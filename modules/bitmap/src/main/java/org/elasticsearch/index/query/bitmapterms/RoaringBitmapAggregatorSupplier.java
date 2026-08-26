@@ -25,6 +25,7 @@ interface RoaringBitmapAggregatorSupplier {
         InternalRoaringBitmap.BitmapFormat width,
         AggregationContext context,
         Aggregator parent,
-        Map<String, Object> metadata
+        Map<String, Object> metadata,
+        int maxValues
     ) throws IOException;
 }

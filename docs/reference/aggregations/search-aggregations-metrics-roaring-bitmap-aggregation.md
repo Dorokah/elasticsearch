@@ -96,6 +96,9 @@ The response contains a portable 64-bit roaring bitmap holding the distinct valu
 `missing`
 :   (Optional, integer) Value to use for documents that do not have a value for `field`. The value must be non-negative and fit the field's `integer` or `long` type. By default, documents without a value are ignored.
 
+`max_values`
+:   (Optional, integer) Maximum number of distinct values this request may return. A request can only lower the ceiling, never raise it above the `search.max_roaring_bitmap_values` node setting. Duplicate values do not count towards the limit, so a field with few distinct values can match any number of documents.
+
 ## Response and bitmap format [roaring-bitmap-aggregation-format]
 
 The field type determines the result format:
@@ -151,6 +154,67 @@ bitmap.deserialize(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN));
 ```
 
 See [Bitmap format](/reference/query-languages/query-dsl/query-dsl-bitmap-terms-query.md#bitmap-terms-format) for compatible libraries and serialization details.
+
+## Limits [roaring-bitmap-aggregation-limits]
+
+Unlike `cardinality`, this aggregation returns every matching value, so its response grows with the
+number of distinct values matched. The `search.max_roaring_bitmap_values` node setting caps that
+number, and defaults to `1000000`. A request that collects more distinct values fails with an error
+naming the setting, both on an individual shard and when shard results are combined.
+
+Set it in `elasticsearch.yml`:
+
+```yaml
+search.max_roaring_bitmap_values: 2000000
+```
+
+Use the `max_values` request parameter to apply a lower ceiling to a single request.
+
+The limit counts distinct values, not matching documents. A query matching many documents with few
+distinct values stays well inside it.
+
+Memory and response size depend on how the values are spread rather than how many there are. Values
+packed into a small range compress into runs, while values scattered across a wide 64-bit range do
+not:
+
+| 1,000,000 distinct values | Serialized size |
+|---|---|
+| Contiguous `long` values (`0`-`999999`) | 242 bytes |
+| Sparse 64-bit values, each in its own high word | about 22 MB |
+
+Because a sparse 64-bit value costs roughly 22 bytes serialized and about 29 bytes once base64
+encoded, a large result can dominate the response. Raise the limit only after confirming that both
+the response size and the heap required to build it are acceptable on your cluster.
+
+### Retrieve more values than the limit allows [roaring-bitmap-aggregation-paging]
+
+To retrieve a set larger than the limit, split the request into disjoint ranges over the aggregated
+field and combine the bitmaps on the client. Each window returns an exact set for its range, so the
+union is exactly the set the unsplit request would have produced:
+
+```console
+GET product-catalog/_search
+{
+  "size": 0,
+  "track_total_hits": false,
+  "query": {
+    "range": {
+      "product_id": { "gte": 0, "lt": 1000000 }
+    }
+  },
+  "aggs": {
+    "product_ids": {
+      "roaring_bitmap": {
+        "field": "product_id"
+      }
+    }
+  }
+}
+```
+% TEST[continued]
+
+Repeat with the next range to walk the whole set. Because the windows are defined by field value
+rather than by result order, the split is deterministic and can be resumed.
 
 ## Choosing an aggregation [roaring-bitmap-aggregation-choose]
 

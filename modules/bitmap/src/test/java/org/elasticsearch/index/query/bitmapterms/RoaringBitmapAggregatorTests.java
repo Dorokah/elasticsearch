@@ -17,6 +17,7 @@ import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.CircuitBreakingException;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.LimitedBreaker;
@@ -148,6 +149,73 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
         );
     }
 
+    public void testMaxValuesRejectsMoreDistinctValuesThanAllowed() throws Exception {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> aggregate(NumberFieldMapper.NumberType.LONG, builder -> builder.maxValues(2), 1, 2, 3)
+        );
+
+        assertThat(exception.getMessage(), containsString("collected more than [2] distinct values"));
+        assertThat(exception.getMessage(), containsString(RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey()));
+    }
+
+    /**
+     * The limit bounds the size of the result, so it must count distinct values rather than collected
+     * ones. A duplicate-heavy field can match far more documents than the limit while still producing a
+     * small bitmap, and that must be allowed.
+     */
+    public void testMaxValuesCountsDistinctValuesRatherThanDocuments() throws Exception {
+        InternalRoaringBitmap result = aggregate(NumberFieldMapper.NumberType.LONG, builder -> builder.maxValues(2), 1, 1, 1, 2, 2, 2);
+
+        assertThat(drain(LongBitmap.deserializePortable(result.bitmap())), equalTo(List.of(1L, 2L)));
+    }
+
+    public void testNodeSettingIsACeilingNotADefault() {
+        Settings nodeSettings = Settings.builder().put(RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey(), 500).build();
+
+        // No request value: the node limit applies.
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(null, nodeSettings), equalTo(500));
+        // A request may ask for fewer.
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(100, nodeSettings), equalTo(100));
+        // A request may not raise the ceiling.
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(5000, nodeSettings), equalTo(500));
+        // Default when unset.
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(null, Settings.EMPTY), equalTo(1_000_000));
+    }
+
+    public void testMaxValuesMustBePositive() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RoaringBitmapAggregationBuilder("ids").maxValues(0)
+        );
+
+        assertThat(exception.getMessage(), containsString("[max_values] must be at least 1"));
+    }
+
+    /**
+     * Every shard can respect the limit and the union still exceed it, so the reduce phase has to apply
+     * the limit again. Without this the effective ceiling would be shards * limit.
+     */
+    public void testReduceRejectsUnionAboveLimit() throws Exception {
+        InternalRoaringBitmap firstShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1, 1);
+        InternalRoaringBitmap secondShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1L << 40, 1);
+        AggregationReduceContext reduceContext = new AggregationReduceContext.ForFinal(
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            () -> false,
+            AggregatorFactories.builder(),
+            ignored -> {},
+            null
+        );
+
+        try (AggregatorReducer reducer = firstShard.getReducer(reduceContext, 2)) {
+            reducer.accept(firstShard);
+            reducer.accept(secondShard);
+            IllegalArgumentException exception = expectThrows(IllegalArgumentException.class, reducer::get);
+            assertThat(exception.getMessage(), containsString("reduced to more than [1] distinct values across shards"));
+        }
+    }
+
     public void testReducerRejectsWidthMismatch() throws Exception {
         InternalRoaringBitmap integerResult = result(InternalRoaringBitmap.BitmapFormat.INT, 1);
         InternalRoaringBitmap longResult = result(InternalRoaringBitmap.BitmapFormat.LONG, 1L << 40);
@@ -207,6 +275,14 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
     }
 
     private InternalRoaringBitmap aggregate(NumberFieldMapper.NumberType type, long... values) throws Exception {
+        return aggregate(type, builder -> {}, values);
+    }
+
+    private InternalRoaringBitmap aggregate(
+        NumberFieldMapper.NumberType type,
+        java.util.function.Consumer<RoaringBitmapAggregationBuilder> customise,
+        long... values
+    ) throws Exception {
         MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType(FIELD, type);
         try (Directory directory = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), directory)) {
             for (long value : values) {
@@ -215,15 +291,21 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
                 writer.addDocument(document);
             }
             try (IndexReader reader = writer.getReader()) {
-                return searchAndReduce(reader, new AggTestConfig(new RoaringBitmapAggregationBuilder("ids").field(FIELD), fieldType));
+                RoaringBitmapAggregationBuilder builder = new RoaringBitmapAggregationBuilder("ids").field(FIELD);
+                customise.accept(builder);
+                return searchAndReduce(reader, new AggTestConfig(builder, fieldType));
             }
         }
     }
 
     private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value) throws IOException {
+        return result(width, value, Integer.MAX_VALUE);
+    }
+
+    private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value, int maxValues) throws IOException {
         InternalRoaringBitmap.MutableBitmap bitmap = InternalRoaringBitmap.mutable(width);
         bitmap.add(value);
-        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null);
+        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null, maxValues);
     }
 
     private static void assertReservationCoversReportedGrowth(

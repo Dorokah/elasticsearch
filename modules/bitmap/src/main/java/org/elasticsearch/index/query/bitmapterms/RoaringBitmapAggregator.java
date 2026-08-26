@@ -43,12 +43,21 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
     static final long INT_BYTES_PER_VALUE = 80;
     static final long LONG_BYTES_PER_VALUE = 384;
 
+    // Roaring reports cardinality by walking every container, so checking it on every insertion would
+    // reintroduce the quadratic cost the reservation batching above exists to avoid. Check on the same
+    // cadence instead: collection may overshoot the limit by up to this many values, which is immaterial
+    // next to the limit itself, and buildAggregation re-checks exactly so a returned result is never
+    // over the limit.
+    static final int LIMIT_CHECK_INTERVAL = BREAKER_RESERVATION_VALUES;
+
     private final ValuesSource.Numeric valuesSource;
     private final InternalRoaringBitmap.BitmapFormat width;
     private final LongObjectPagedHashMap<AccountedBitmap> bitmaps;
+    private final int maxValues;
     private long accountedBitmapBytes;
     private int valuesUntilNextBreakerReservation;
     private int valuesSinceMemoryReconciliation;
+    private int valuesUntilNextLimitCheck;
 
     RoaringBitmapAggregator(
         String name,
@@ -56,11 +65,13 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         InternalRoaringBitmap.BitmapFormat width,
         AggregationContext context,
         Aggregator parent,
-        Map<String, Object> metadata
+        Map<String, Object> metadata,
+        int maxValues
     ) throws IOException {
         super(name, context, parent, metadata);
         this.valuesSource = valuesSource;
         this.width = width;
+        this.maxValues = maxValues;
         this.bitmaps = new LongObjectPagedHashMap<>(1, bigArrays());
     }
 
@@ -94,6 +105,10 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
                     }
                     reserveBreakerBytes();
                     accountedBitmap.bitmap.add(value);
+                    if (--valuesUntilNextLimitCheck <= 0) {
+                        checkMaxValues(accountedBitmap.bitmap.cardinality());
+                        valuesUntilNextLimitCheck = LIMIT_CHECK_INTERVAL;
+                    }
                     if (++valuesSinceMemoryReconciliation == MEMORY_RECONCILIATION_INTERVAL) {
                         accountBitmapMemory();
                     }
@@ -105,12 +120,14 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
     @Override
     public InternalAggregation buildAggregation(long owningBucketOrd) throws IOException {
         if (width == InternalRoaringBitmap.BitmapFormat.UNMAPPED) {
-            return InternalRoaringBitmap.unmapped(name, metadata());
+            return InternalRoaringBitmap.unmapped(name, metadata(), maxValues);
         }
         AccountedBitmap accountedBitmap = bitmaps.get(owningBucketOrd);
         if (accountedBitmap == null) {
-            return InternalRoaringBitmap.empty(name, width, metadata());
+            return InternalRoaringBitmap.empty(name, width, metadata(), maxValues);
         }
+        // Authoritative check: collection only samples the cardinality every LIMIT_CHECK_INTERVAL values.
+        checkMaxValues(accountedBitmap.bitmap.cardinality());
         accountBitmapMemory(accountedBitmap);
         accountedBitmap.bitmap.optimize();
         accountBitmapMemory(accountedBitmap);
@@ -135,15 +152,37 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         // gap is not specific to this aggregation -- every InternalAggregation outlives its
         // aggregator -- so it is left open rather than worked around here.
         addRequestCircuitBreakerBytes(serialized.length);
-        return new InternalRoaringBitmap(name, width, serialized, metadata());
+        return new InternalRoaringBitmap(name, width, serialized, metadata(), maxValues);
     }
 
     @Override
     public InternalAggregation buildEmptyAggregation() {
         if (width == InternalRoaringBitmap.BitmapFormat.UNMAPPED) {
-            return InternalRoaringBitmap.unmapped(name, metadata());
+            return InternalRoaringBitmap.unmapped(name, metadata(), maxValues);
         }
-        return InternalRoaringBitmap.empty(name, width, metadata());
+        return InternalRoaringBitmap.empty(name, width, metadata(), maxValues);
+    }
+
+    /**
+     * Fails with a message naming the limit and the setting that governs it. Without this the same
+     * request fails only once the request circuit breaker happens to trip, which reports bytes rather
+     * than values and moves with heap size, giving the caller nothing actionable to change.
+     */
+    private void checkMaxValues(long cardinality) {
+        if (cardinality > maxValues) {
+            throw new IllegalArgumentException(
+                "["
+                    + RoaringBitmapAggregationBuilder.NAME
+                    + "] aggregation ["
+                    + name
+                    + "] collected more than ["
+                    + maxValues
+                    + "] distinct values. Narrow the query, or raise the limit with the ["
+                    + RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey()
+                    + "] node setting. To retrieve a large set of values, split the request into "
+                    + "disjoint ranges over the aggregated field and combine the resulting bitmaps."
+            );
+        }
     }
 
     @Override

@@ -25,6 +25,7 @@ import java.util.Map;
 final class RoaringBitmapAggregatorFactory extends ValuesSourceAggregatorFactory {
 
     private final RoaringBitmapAggregatorSupplier supplier;
+    private final int maxValues;
 
     RoaringBitmapAggregatorFactory(
         String name,
@@ -33,15 +34,17 @@ final class RoaringBitmapAggregatorFactory extends ValuesSourceAggregatorFactory
         AggregatorFactory parent,
         AggregatorFactories.Builder subFactoriesBuilder,
         Map<String, Object> metadata,
-        RoaringBitmapAggregatorSupplier supplier
+        RoaringBitmapAggregatorSupplier supplier,
+        int maxValues
     ) throws IOException {
         super(name, config, context, parent, subFactoriesBuilder, metadata);
         this.supplier = supplier;
+        this.maxValues = maxValues;
     }
 
     @Override
     protected Aggregator createUnmapped(Aggregator parent, Map<String, Object> metadata) throws IOException {
-        return new RoaringBitmapAggregator(name, null, InternalRoaringBitmap.BitmapFormat.UNMAPPED, context, parent, metadata);
+        return new RoaringBitmapAggregator(name, null, InternalRoaringBitmap.BitmapFormat.UNMAPPED, context, parent, metadata, maxValues);
     }
 
     @Override
@@ -66,6 +69,6 @@ final class RoaringBitmapAggregatorFactory extends ValuesSourceAggregatorFactory
                     + "]; only [integer] and [long] fields are supported"
             );
         };
-        return supplier.build(name, numeric, width, context, parent, metadata);
+        return supplier.build(name, numeric, width, context, parent, metadata, maxValues);
     }
 }
