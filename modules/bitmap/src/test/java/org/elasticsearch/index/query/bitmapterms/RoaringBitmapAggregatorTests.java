@@ -30,6 +30,7 @@ import org.apache.lucene.util.NumericUtils;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.CircuitBreakingException;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.LimitedBreaker;
@@ -311,6 +312,86 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
         assertThat(exception.getMessage(), containsString("only supports non-negative values"));
     }
 
+    public void testMaxValuesRejectsMoreDistinctValuesThanAllowed() throws Exception {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> aggregate(NumberFieldMapper.NumberType.LONG, builder -> builder.maxValues(2), 1, 2, 3)
+        );
+
+        assertThat(exception.getMessage(), containsString("collected more than [2] distinct values"));
+        assertThat(exception.getMessage(), containsString(RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey()));
+    }
+
+    /**
+     * The limit bounds the size of the result, so it must count distinct values rather than collected
+     * ones. A duplicate-heavy field can match far more documents than the limit while still producing a
+     * small bitmap, and that must be allowed.
+     */
+    public void testMaxValuesCountsDistinctValuesRatherThanDocuments() throws Exception {
+        InternalRoaringBitmap result = aggregate(NumberFieldMapper.NumberType.LONG, builder -> builder.maxValues(2), 1, 1, 1, 2, 2, 2);
+
+        assertThat(drain(LongBitmap.deserializePortable(result.bitmap())), equalTo(List.of(1L, 2L)));
+    }
+
+    /**
+     * The terms-index fast path collects without going through the doc-values collector, so the ceiling
+     * has to be enforced on that path too or it can be bypassed entirely.
+     */
+    public void testMaxValuesAppliesToTermsIndexFastPath() throws Exception {
+        long[] values = new long[RoaringBitmapAggregator.MIN_VALUES_PER_MEASUREMENT + 8];
+        for (int i = 0; i < values.length; i++) {
+            values[i] = i;
+        }
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> aggregateTerms(NumberFieldMapper.NumberType.LONG, builder -> builder.maxValues(4), values)
+        );
+
+        assertThat(exception.getMessage(), containsString("collected more than [4] distinct values"));
+    }
+
+    public void testMaxValuesMustBePositive() {
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> new RoaringBitmapAggregationBuilder("ids").maxValues(0)
+        );
+
+        assertThat(exception.getMessage(), containsString("[max_values] must be at least 1"));
+    }
+
+    public void testRequestCannotRaiseTheLimitAboveTheNodeSetting() {
+        Settings nodeSettings = Settings.builder().put(RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey(), 10).build();
+
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(5, nodeSettings), equalTo(5));
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(1000, nodeSettings), equalTo(10));
+        assertThat(RoaringBitmapAggregationBuilder.resolveMaxValues(null, nodeSettings), equalTo(10));
+    }
+
+    /**
+     * Every shard can respect the limit while the union still exceeds it, so the reduce phase has to
+     * apply the limit again. Without this the effective ceiling would be shards * limit.
+     */
+    public void testReduceRejectsUnionAboveLimit() throws Exception {
+        InternalRoaringBitmap firstShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1, 1);
+        InternalRoaringBitmap secondShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1L << 40, 1);
+        AggregationReduceContext reduceContext = new AggregationReduceContext.ForFinal(
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            () -> false,
+            AggregatorFactories.builder(),
+            ignored -> {},
+            null
+        );
+
+        try (AggregatorReducer reducer = firstShard.getReducer(reduceContext, 2)) {
+            reducer.accept(firstShard);
+            reducer.accept(secondShard);
+            IllegalArgumentException exception = expectThrows(IllegalArgumentException.class, reducer::get);
+            assertThat(exception.getMessage(), containsString("reduced to more than [1] distinct values across shards"));
+        }
+    }
+
     public void testMultiValuedField() throws Exception {
         MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType(FIELD, NumberFieldMapper.NumberType.LONG);
         try (Directory directory = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), directory)) {
@@ -478,6 +559,14 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
     }
 
     private InternalRoaringBitmap aggregate(NumberFieldMapper.NumberType type, long... values) throws Exception {
+        return aggregate(type, builder -> {}, values);
+    }
+
+    private InternalRoaringBitmap aggregate(
+        NumberFieldMapper.NumberType type,
+        Consumer<RoaringBitmapAggregationBuilder> customise,
+        long... values
+    ) throws Exception {
         MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType(FIELD, type);
         try (Directory directory = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), directory)) {
             for (long value : values) {
@@ -486,21 +575,33 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
                 writer.addDocument(document);
             }
             try (IndexReader reader = writer.getReader()) {
-                return searchAndReduce(reader, new AggTestConfig(new RoaringBitmapAggregationBuilder("ids").field(FIELD), fieldType));
+                RoaringBitmapAggregationBuilder builder = new RoaringBitmapAggregationBuilder("ids").field(FIELD);
+                customise.accept(builder);
+                return searchAndReduce(reader, new AggTestConfig(builder, fieldType));
             }
         }
     }
 
     private InternalRoaringBitmap aggregateTerms(NumberFieldMapper.NumberType type, long... values) throws Exception {
+        return aggregateTerms(type, builder -> {}, values);
+    }
+
+    private InternalRoaringBitmap aggregateTerms(
+        NumberFieldMapper.NumberType type,
+        Consumer<RoaringBitmapAggregationBuilder> customise,
+        long... values
+    ) throws Exception {
         MappedFieldType fieldType = indexTermsFieldType(type);
         try (Directory directory = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), directory)) {
             for (long value : values) {
                 writer.addDocument(termsDocument(type, value));
             }
             try (IndexReader reader = writer.getReader()) {
+                RoaringBitmapAggregationBuilder builder = new RoaringBitmapAggregationBuilder("ids").field(FIELD);
+                customise.accept(builder);
                 return searchAndReduce(
                     reader,
-                    new AggTestConfig(new RoaringBitmapAggregationBuilder("ids").field(FIELD), fieldType).withCheckAggregator(
+                    new AggTestConfig(builder, fieldType).withCheckAggregator(
                         aggregator -> assertTrue(((RoaringBitmapAggregator) aggregator).usesTermsIndex())
                     )
                 );
@@ -604,9 +705,13 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
     }
 
     private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value) throws IOException {
+        return result(width, value, Integer.MAX_VALUE);
+    }
+
+    private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value, int maxValues) throws IOException {
         InternalRoaringBitmap.MutableBitmap bitmap = InternalRoaringBitmap.mutable(width);
         bitmap.add(value);
-        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null);
+        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null, maxValues);
     }
 
     private static List<Long> drain(BitmapValues values) throws IOException {

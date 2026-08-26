@@ -9,6 +9,7 @@
 
 package org.elasticsearch.index.query.bitmapterms;
 
+import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.SearchPlugin;
 
@@ -16,6 +17,11 @@ import java.util.Collections;
 import java.util.List;
 
 public class BitmapPlugin extends Plugin implements SearchPlugin {
+    @Override
+    public List<Setting<?>> getSettings() {
+        return List.of(RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING);
+    }
+
     @Override
     public List<QuerySpec<?>> getQueries() {
         return Collections.singletonList(
