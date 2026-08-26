@@ -453,3 +453,73 @@
   - match: { aggregations.odd.doc_count: 2 }
   # a single-bucket parent yields the same distinct set {5, 15} as the equivalent top-level query
   - match: { aggregations.odd.ids.value: "OjAAAAEAAAAAAAEAEAAAAAUADwA=" }
+
+---
+"roaring_bitmap aggregation rejects a request that exceeds max_values":
+
+  - do:
+      indices.create:
+        index: test_roaring_bitmap_max_values
+        body:
+          settings:
+            number_of_shards: 1
+          mappings:
+            properties:
+              id:
+                type: long
+
+  - do:
+      bulk:
+        refresh: true
+        index: test_roaring_bitmap_max_values
+        body:
+          - '{"index": {}}'
+          - '{"id": 1}'
+          - '{"index": {}}'
+          - '{"id": 2}'
+          - '{"index": {}}'
+          - '{"id": 3}'
+
+  # Three distinct values against a ceiling of two must fail, and the message must name the setting
+  # so the caller knows what to change.
+  - do:
+      catch: /collected more than \[2\] distinct values/
+      search:
+        index: test_roaring_bitmap_max_values
+        body:
+          size: 0
+          track_total_hits: false
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: id
+                max_values: 2
+
+  # Duplicates must not count towards the ceiling: six documents, two distinct values, ceiling of two.
+  - do:
+      bulk:
+        refresh: true
+        index: test_roaring_bitmap_duplicates_under_limit
+        body:
+          - '{"index": {}}'
+          - '{"id": 7}'
+          - '{"index": {}}'
+          - '{"id": 7}'
+          - '{"index": {}}'
+          - '{"id": 8}'
+          - '{"index": {}}'
+          - '{"id": 8}'
+
+  - do:
+      search:
+        index: test_roaring_bitmap_duplicates_under_limit
+        body:
+          size: 0
+          track_total_hits: false
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: id
+                max_values: 2
+
+  - is_true: aggregations.ids.value

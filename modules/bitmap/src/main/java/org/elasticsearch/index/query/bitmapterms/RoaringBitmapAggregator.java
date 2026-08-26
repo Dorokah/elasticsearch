@@ -48,6 +48,7 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
     static final int MIN_VALUES_PER_MEASUREMENT = 1 << 10;
     private static final int MEASUREMENT_GROWTH_FRACTION = 4;
 
+    private final int maxValues;
     private final ValuesSource.Numeric valuesSource;
     private final InternalRoaringBitmap.BitmapFormat width;
     private final String termsField;
@@ -64,9 +65,11 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         InternalRoaringBitmap.BitmapFormat width,
         AggregationContext context,
         Aggregator parent,
-        Map<String, Object> metadata
+        Map<String, Object> metadata,
+        int maxValues
     ) throws IOException {
         super(name, context, parent, metadata);
+        this.maxValues = maxValues;
         this.valuesSource = valuesSource;
         this.width = width;
         this.termsField = termsFieldIfAvailable(config);
@@ -197,6 +200,8 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         // Measure before reading reservedBytes below, and again after optimize() so the reservation
         // follows the bitmap shrinking as array containers become run containers.
         measureBitmap();
+        // Authoritative check: collection only samples the cardinality on the measurement cadence.
+        checkMaxValues();
         bitmap.optimize();
         measureBitmap();
         checkCancelled();
@@ -219,15 +224,15 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         // gap is not specific to this aggregation -- InternalCardinality likewise leaves its
         // retained sketch unaccounted -- so it is left open rather than worked around here.
         addRequestCircuitBreakerBytes(serialized.length);
-        return new InternalRoaringBitmap(name, width, serialized, metadata());
+        return new InternalRoaringBitmap(name, width, serialized, metadata(), maxValues);
     }
 
     @Override
     public InternalAggregation buildEmptyAggregation() {
         if (width == InternalRoaringBitmap.BitmapFormat.UNMAPPED) {
-            return InternalRoaringBitmap.unmapped(name, metadata());
+            return InternalRoaringBitmap.unmapped(name, metadata(), maxValues);
         }
-        return InternalRoaringBitmap.empty(name, width, metadata());
+        return InternalRoaringBitmap.empty(name, width, metadata(), maxValues);
     }
 
     @Override
@@ -240,9 +245,38 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         if (++valuesCollected < measureAtValueCount) {
             return;
         }
-        // Cancellation rides along because both want the same cheap periodic hook.
+        // Cancellation and the value ceiling ride along: all three want the same cheap periodic hook,
+        // and routing the ceiling through here covers the terms-index fast path too, which calls
+        // accountForValue() per term and would otherwise bypass the check entirely.
         checkCancelled();
         measureBitmap();
+        checkMaxValues();
+    }
+
+    /**
+     * Fails with a message naming the limit and the setting that governs it. Without this the same
+     * request fails only once the request circuit breaker happens to trip, which reports bytes rather
+     * than values and moves with heap size, so the caller gets nothing actionable to change.
+     * <p>
+     * Sampled on the measurement cadence rather than checked per value, because Roaring computes
+     * cardinality by walking every container. buildAggregation checks once more, exactly, so a
+     * returned result is never over the limit.
+     */
+    private void checkMaxValues() {
+        if (bitmap != null && bitmap.cardinality() > maxValues) {
+            throw new IllegalArgumentException(
+                "["
+                    + RoaringBitmapAggregationBuilder.NAME
+                    + "] aggregation ["
+                    + name
+                    + "] collected more than ["
+                    + maxValues
+                    + "] distinct values. Narrow the query, or raise the limit with the ["
+                    + RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey()
+                    + "] cluster setting. To retrieve a large set of values, split the request into "
+                    + "disjoint ranges over the aggregated field and combine the resulting bitmaps."
+            );
+        }
     }
 
     /**
