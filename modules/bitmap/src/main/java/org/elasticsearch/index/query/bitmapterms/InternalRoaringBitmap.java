@@ -59,6 +59,8 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     interface MutableBitmap extends Accountable {
         void add(long value);
 
+        long cardinality();
+
         void or(MutableBitmap other);
 
         void optimize();
@@ -84,25 +86,32 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     private final BitmapFormat width;
     private final byte[] bitmap;
 
-    InternalRoaringBitmap(String name, BitmapFormat width, byte[] bitmap, Map<String, Object> metadata) {
+    // Carried on the result rather than read from a setting during reduce: AggregationReduceContext
+    // exposes no settings, and per-shard limits alone would let the union reach shards * limit,
+    // which is the same per-shard multiplication that makes terminate_after surprising.
+    private final int maxValues;
+
+    InternalRoaringBitmap(String name, BitmapFormat width, byte[] bitmap, Map<String, Object> metadata, int maxValues) {
         super(name, metadata);
         this.width = Objects.requireNonNull(width);
         this.bitmap = Objects.requireNonNull(bitmap);
+        this.maxValues = maxValues;
     }
 
     public InternalRoaringBitmap(StreamInput in) throws IOException {
         super(in);
         width = BitmapFormat.read(in.readByte());
         bitmap = in.readByteArray();
+        maxValues = in.readVInt();
     }
 
-    static InternalRoaringBitmap unmapped(String name, Map<String, Object> metadata) {
-        return new InternalRoaringBitmap(name, BitmapFormat.UNMAPPED, new byte[0], metadata);
+    static InternalRoaringBitmap unmapped(String name, Map<String, Object> metadata, int maxValues) {
+        return new InternalRoaringBitmap(name, BitmapFormat.UNMAPPED, new byte[0], metadata, maxValues);
     }
 
-    static InternalRoaringBitmap empty(String name, BitmapFormat width, Map<String, Object> metadata) {
+    static InternalRoaringBitmap empty(String name, BitmapFormat width, Map<String, Object> metadata, int maxValues) {
         try {
-            return new InternalRoaringBitmap(name, width, mutable(width).serialize(), metadata);
+            return new InternalRoaringBitmap(name, width, mutable(width).serialize(), metadata, maxValues);
         } catch (IOException e) {
             throw new IllegalStateException("failed to serialize an empty Roaring bitmap", e);
         }
@@ -144,6 +153,7 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     protected void doWriteTo(StreamOutput out) throws IOException {
         out.writeByte(width.id);
         out.writeByteArray(bitmap);
+        out.writeVInt(maxValues);
     }
 
     @Override
@@ -232,7 +242,24 @@ public final class InternalRoaringBitmap extends InternalAggregation {
             @Override
             public InternalAggregation get() {
                 if (reduced == null) {
-                    return unmapped(name, getMetadata());
+                    return unmapped(name, getMetadata(), maxValues);
+                }
+                // The union of per-shard results can exceed the limit even when every shard respected it.
+                long cardinality = reduced.cardinality();
+                if (cardinality > maxValues) {
+                    throw new IllegalArgumentException(
+                        "["
+                            + RoaringBitmapAggregationBuilder.NAME
+                            + "] aggregation ["
+                            + name
+                            + "] reduced to more than ["
+                            + maxValues
+                            + "] distinct values across shards. Narrow the query, or raise the limit with "
+                            + "the ["
+                            + RoaringBitmapAggregationBuilder.MAX_VALUES_SETTING.getKey()
+                            + "] node setting. To retrieve a large set of values, split the request into "
+                            + "disjoint ranges over the aggregated field and combine the resulting bitmaps."
+                    );
                 }
                 checkCancelled();
                 long before = reduced.ramBytesUsed();
@@ -242,7 +269,7 @@ public final class InternalRoaringBitmap extends InternalAggregation {
                 long serializationBytes = 2L * reduced.ramBytesUsed();
                 adjustBreaker(serializationBytes);
                 try {
-                    return new InternalRoaringBitmap(name, reduced.width(), reduced.serialize(), getMetadata());
+                    return new InternalRoaringBitmap(name, reduced.width(), reduced.serialize(), getMetadata(), maxValues);
                 } catch (IOException e) {
                     throw new IllegalStateException("failed to serialize reduced [roaring_bitmap] aggregation", e);
                 } finally {
@@ -303,12 +330,12 @@ public final class InternalRoaringBitmap extends InternalAggregation {
             return false;
         }
         InternalRoaringBitmap that = (InternalRoaringBitmap) object;
-        return width == that.width && Arrays.equals(bitmap, that.bitmap);
+        return width == that.width && maxValues == that.maxValues && Arrays.equals(bitmap, that.bitmap);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), width, Arrays.hashCode(bitmap));
+        return Objects.hash(super.hashCode(), width, maxValues, Arrays.hashCode(bitmap));
     }
 
     private static final class IntMutableBitmap implements MutableBitmap {
@@ -343,6 +370,11 @@ public final class InternalRoaringBitmap extends InternalAggregation {
                 bitmap.serialize(out);
             }
             return bytes.toByteArray();
+        }
+
+        @Override
+        public long cardinality() {
+            return bitmap.getLongCardinality();
         }
 
         @Override
@@ -386,6 +418,11 @@ public final class InternalRoaringBitmap extends InternalAggregation {
                 bitmap.serializePortable(out);
             }
             return bytes.toByteArray();
+        }
+
+        @Override
+        public long cardinality() {
+            return bitmap.getLongCardinality();
         }
 
         @Override
