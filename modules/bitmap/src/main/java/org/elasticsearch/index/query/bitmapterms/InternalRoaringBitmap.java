@@ -18,6 +18,7 @@ import org.elasticsearch.search.aggregations.AggregatorReducer;
 import org.elasticsearch.search.aggregations.InternalAggregation;
 import org.elasticsearch.search.aggregations.support.SamplingContext;
 import org.elasticsearch.tasks.TaskCancelledException;
+import org.elasticsearch.xcontent.ParseField;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.roaringbitmap.RoaringBitmap;
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
@@ -81,31 +82,53 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     // whole bitmap in one go, after which ramBytesUsed() above trues the reservation up.
     static final long DESERIALIZATION_EXPANSION_FACTOR = 9;
 
+    static final ParseField COMPLETE = new ParseField("complete");
+
     private final BitmapFormat width;
     private final byte[] bitmap;
 
-    InternalRoaringBitmap(String name, BitmapFormat width, byte[] bitmap, Map<String, Object> metadata) {
+    /**
+     * Whether this bitmap holds every matching value, or collection stopped early.
+     * <p>
+     * A truncated bitmap is a valid bitmap: nothing about the bytes says it is short of a few million
+     * values. That matters more here than for most aggregations, because the documented use of this
+     * result is to feed it back into a {@code bitmap_terms} query, where a silently partial set reads
+     * as a complete one and quietly returns the wrong documents.
+     */
+    private final boolean complete;
+
+    InternalRoaringBitmap(String name, BitmapFormat width, byte[] bitmap, Map<String, Object> metadata, boolean complete) {
         super(name, metadata);
         this.width = Objects.requireNonNull(width);
         this.bitmap = Objects.requireNonNull(bitmap);
+        this.complete = complete;
     }
 
     public InternalRoaringBitmap(StreamInput in) throws IOException {
         super(in);
         width = BitmapFormat.read(in.readByte());
         bitmap = in.readByteArray();
+        // A node that predates the flag never reports partial results, so its bitmaps are complete as
+        // far as it is able to say.
+        complete = in.getTransportVersion().supports(RoaringBitmapAggregationBuilder.ROARING_BITMAP_COMPLETE_ADDED)
+            ? in.readBoolean()
+            : true;
     }
 
     static InternalRoaringBitmap unmapped(String name, Map<String, Object> metadata) {
-        return new InternalRoaringBitmap(name, BitmapFormat.UNMAPPED, new byte[0], metadata);
+        return new InternalRoaringBitmap(name, BitmapFormat.UNMAPPED, new byte[0], metadata, true);
     }
 
     static InternalRoaringBitmap empty(String name, BitmapFormat width, Map<String, Object> metadata) {
         try {
-            return new InternalRoaringBitmap(name, width, mutable(width).serialize(), metadata);
+            return new InternalRoaringBitmap(name, width, mutable(width).serialize(), metadata, true);
         } catch (IOException e) {
             throw new IllegalStateException("failed to serialize an empty Roaring bitmap", e);
         }
+    }
+
+    boolean isComplete() {
+        return complete;
     }
 
     static MutableBitmap mutable(BitmapFormat width) {
@@ -144,6 +167,9 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     protected void doWriteTo(StreamOutput out) throws IOException {
         out.writeByte(width.id);
         out.writeByteArray(bitmap);
+        if (out.getTransportVersion().supports(RoaringBitmapAggregationBuilder.ROARING_BITMAP_COMPLETE_ADDED)) {
+            out.writeBoolean(complete);
+        }
     }
 
     @Override
@@ -155,12 +181,18 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     protected AggregatorReducer getLeaderReducer(AggregationReduceContext reduceContext, int size) {
         return new AggregatorReducer() {
             private MutableBitmap reduced;
+            // One short shard makes the union short, so completeness is an AND across every result --
+            // including UNMAPPED ones, which contribute no values but still carry a verdict.
+            private boolean allComplete = true;
             private long breakerBytes;
 
             @Override
             public void accept(InternalAggregation aggregation) {
                 checkCancelled();
                 InternalRoaringBitmap next = (InternalRoaringBitmap) aggregation;
+                // Before the UNMAPPED short-circuit: such a shard contributes no values but still
+                // reports whether it finished, and that verdict has to survive.
+                allComplete &= next.complete;
                 if (next.width == BitmapFormat.UNMAPPED) {
                     return;
                 }
@@ -232,7 +264,7 @@ public final class InternalRoaringBitmap extends InternalAggregation {
             @Override
             public InternalAggregation get() {
                 if (reduced == null) {
-                    return unmapped(name, getMetadata());
+                    return new InternalRoaringBitmap(name, BitmapFormat.UNMAPPED, new byte[0], getMetadata(), allComplete);
                 }
                 checkCancelled();
                 long before = reduced.ramBytesUsed();
@@ -242,7 +274,7 @@ public final class InternalRoaringBitmap extends InternalAggregation {
                 long serializationBytes = 2L * reduced.ramBytesUsed();
                 adjustBreaker(serializationBytes);
                 try {
-                    return new InternalRoaringBitmap(name, reduced.width(), reduced.serialize(), getMetadata());
+                    return new InternalRoaringBitmap(name, reduced.width(), reduced.serialize(), getMetadata(), allComplete);
                 } catch (IOException e) {
                     throw new IllegalStateException("failed to serialize reduced [roaring_bitmap] aggregation", e);
                 } finally {
@@ -273,9 +305,13 @@ public final class InternalRoaringBitmap extends InternalAggregation {
     @Override
     public XContentBuilder doXContentBody(XContentBuilder builder, Params params) throws IOException {
         if (width == BitmapFormat.UNMAPPED) {
-            return builder.nullField(CommonFields.VALUE.getPreferredName());
+            builder.nullField(CommonFields.VALUE.getPreferredName());
+        } else {
+            builder.field(CommonFields.VALUE.getPreferredName(), bitmap);
         }
-        return builder.field(CommonFields.VALUE.getPreferredName(), bitmap);
+        // Always written, rather than only when false: a caller that has to notice a missing field to
+        // learn its set is short will usually not notice it.
+        return builder.field(COMPLETE.getPreferredName(), complete);
     }
 
     @Override
@@ -303,12 +339,12 @@ public final class InternalRoaringBitmap extends InternalAggregation {
             return false;
         }
         InternalRoaringBitmap that = (InternalRoaringBitmap) object;
-        return width == that.width && Arrays.equals(bitmap, that.bitmap);
+        return width == that.width && complete == that.complete && Arrays.equals(bitmap, that.bitmap);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(super.hashCode(), width, Arrays.hashCode(bitmap));
+        return Objects.hash(super.hashCode(), width, complete, Arrays.hashCode(bitmap));
     }
 
     private static final class IntMutableBitmap implements MutableBitmap {

@@ -2196,6 +2196,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                 () -> context.rewrittenQuery() == null ? Queries.ALL_DOCS_INSTANCE : context.rewrittenQuery(),
                 context.getProfilers() == null ? null : context.getProfilers().getAggregationProfiler(),
                 multiBucketConsumerService.getLimit(),
+                context.terminateAfter(),
                 () -> new SubSearchContext(context).parsedQuery(context.parsedQuery()).fetchFieldsContext(context.fetchFieldsContext()),
                 context.bitsetFilterCache(),
                 context.indexShard().shardId().hashCode(),

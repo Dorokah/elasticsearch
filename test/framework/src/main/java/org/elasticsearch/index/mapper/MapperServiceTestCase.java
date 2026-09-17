@@ -779,6 +779,11 @@ public abstract class MapperServiceTestCase extends FieldTypeTestCase {
             }
 
             @Override
+            public int terminateAfter() {
+                return org.elasticsearch.search.internal.SearchContext.DEFAULT_TERMINATE_AFTER;
+            }
+
+            @Override
             public int maxBuckets() {
                 return Integer.MAX_VALUE;
             }

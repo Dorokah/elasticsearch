@@ -448,6 +448,7 @@ public abstract class AggregatorTestCase extends ESTestCase {
             () -> query,
             null,
             maxBucket,
+            SearchContext.DEFAULT_TERMINATE_AFTER,
             () -> buildSubSearchContext(
                 indexSettings,
                 searchExecutionContext,

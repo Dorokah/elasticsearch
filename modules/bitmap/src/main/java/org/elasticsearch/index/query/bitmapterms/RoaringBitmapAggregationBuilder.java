@@ -38,6 +38,9 @@ public final class RoaringBitmapAggregationBuilder extends ValuesSourceAggregati
 
     static final TransportVersion ROARING_BITMAP_AGGREGATION_ADDED = TransportVersion.fromName("roaring_bitmap_aggregation_added");
 
+    /** Guards the {@code complete} flag on the result. */
+    static final TransportVersion ROARING_BITMAP_COMPLETE_ADDED = TransportVersion.fromName("roaring_bitmap_complete_added");
+
     static final ValuesSourceRegistry.RegistryKey<RoaringBitmapAggregatorSupplier> REGISTRY_KEY = new ValuesSourceRegistry.RegistryKey<>(
         NAME,
         RoaringBitmapAggregatorSupplier.class

@@ -27,6 +27,7 @@ import org.elasticsearch.search.aggregations.support.AggregationContext;
 import org.elasticsearch.search.aggregations.support.ValuesSource;
 import org.elasticsearch.search.aggregations.support.ValuesSourceConfig;
 import org.elasticsearch.search.internal.ContextIndexSearcher;
+import org.elasticsearch.search.internal.SearchContext;
 import org.elasticsearch.tasks.TaskCancelledException;
 
 import java.io.IOException;
@@ -77,6 +78,23 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
             // so the terms path -- the only caller of decodeTerm -- is unreachable for it.
             case UNMAPPED -> -1;
         };
+    }
+
+    /**
+     * Whether this shard collected every matching value.
+     * <p>
+     * A search timeout stops collection wherever it happens to be and still returns the aggregation, so
+     * the bitmap can be missing an arbitrary part of the match set. The docs recommend {@code timeout}
+     * for exactly the large sets where this is most likely, so the result has to say which it is.
+     */
+    private boolean collectedEverything() {
+        if (context.searcher() instanceof ContextIndexSearcher searcher && searcher.timeExceeded()) {
+            return false;
+        }
+        // terminate_after stops the collector from outside, and the aggregation is not told whether the
+        // limit was actually reached -- only that it was in play. Reporting a set that may be short is
+        // the safe direction to be imprecise in, since the opposite would claim a truncated set is whole.
+        return context.terminateAfter() == SearchContext.DEFAULT_TERMINATE_AFTER;
     }
 
     private void checkCancelled() {
@@ -221,7 +239,7 @@ final class RoaringBitmapAggregator extends MetricsAggregator {
         // gap is not specific to this aggregation -- InternalCardinality likewise leaves its
         // retained sketch unaccounted -- so it is left open rather than worked around here.
         addRequestCircuitBreakerBytes(serialized.length);
-        return new InternalRoaringBitmap(name, width, serialized, metadata());
+        return new InternalRoaringBitmap(name, width, serialized, metadata(), collectedEverything());
     }
 
     @Override
