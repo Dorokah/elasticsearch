@@ -138,6 +138,54 @@ Single-bucket parents are allowed. Wrapping the aggregation in a [`filter`](/ref
 
 A search-level `query` also restricts the bitmap, as in the [example request](#roaring-bitmap-aggregation-example) above.
 
+### Check that the result is complete [roaring-bitmap-aggregation-complete]
+
+Every result carries a `complete` flag alongside `value`:
+
+```console-result
+{
+  "aggregations": {
+    "product_ids": {
+      "value": "<base64-encoded portable roaring bitmap>",
+      "complete": true
+    }
+  }
+}
+```
+
+`complete` is `false` when collection stopped before the whole match set was read, which happens when the search request's `timeout` expires. The bitmap is still a valid bitmap and still contains only values that matched, but it is missing an unspecified part of the set, and which values are missing is not repeatable between requests.
+
+A partial bitmap is indistinguishable from a complete one by its bytes alone, so check this flag before treating a result as the full set — in particular before passing it to `bitmap_terms`, where a partial set silently matches fewer documents than intended.
+
+If any shard returned a partial result, the combined result is reported as incomplete.
+
+### Retrieve a set larger than one request can return [roaring-bitmap-aggregation-ranges]
+
+A very large exact set can exceed the request circuit breaker. To retrieve it, split the request into disjoint ranges over the aggregated field and combine the bitmaps on the client. Each window returns an exact set for its own range, so their union is exactly the set a single unsplit request would have returned:
+
+```console
+GET product-catalog/_search
+{
+  "size": 0,
+  "track_total_hits": false,
+  "query": {
+    "range": {
+      "product_id": { "gte": 0, "lt": 1000000 }
+    }
+  },
+  "aggs": {
+    "product_ids": {
+      "roaring_bitmap": {
+        "field": "product_id"
+      }
+    }
+  }
+}
+```
+% TEST[continued]
+
+Repeat with the next range to walk the whole set. Because the windows are defined by field value rather than by result order, the split is deterministic and can be resumed, and each window's result is complete in its own right.
+
 ### Use the result with `bitmap_terms` [roaring-bitmap-aggregation-use-result]
 
 Supply the returned `value` directly to `bitmap_terms` on a field of the same type:
@@ -196,7 +244,9 @@ This optimization applies when:
 
 Use `roaring_bitmap` when you need the exact distinct set of numeric values. Its memory use depends on the number and distribution of values; dense or run-like sets usually compress more efficiently than sparse 64-bit sets.
 
-Memory use and response size depend on the distinct values, not the number of matching documents. Very large exact sets can trip the request circuit breaker and return a `circuit_breaking_exception`. Set the search request's `timeout` when it might scan a very large match set.
+Memory use and response size depend on the distinct values, not the number of matching documents. Very large exact sets can trip the request circuit breaker and return a `circuit_breaking_exception`.
+
+Setting the search request's `timeout` bounds how long a very large match set is scanned, but it does not return a smaller complete set: collection stops wherever it has reached, so the bitmap is missing an arbitrary part of the match set. Check [`complete`](#roaring-bitmap-aggregation-complete) before using such a result, and prefer [splitting the request by value range](#roaring-bitmap-aggregation-ranges) when you need the whole set.
 
 If you only need a count:
 

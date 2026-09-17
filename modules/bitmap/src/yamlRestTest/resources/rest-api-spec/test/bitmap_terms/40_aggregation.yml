@@ -453,3 +453,118 @@
   - match: { aggregations.odd.doc_count: 2 }
   # a single-bucket parent yields the same distinct set {5, 15} as the equivalent top-level query
   - match: { aggregations.odd.ids.value: "OjAAAAEAAAAAAAEAEAAAAAUADwA=" }
+
+---
+"roaring_bitmap aggregation reports whether the result is complete":
+
+  - do:
+      indices.create:
+        index: test_roaring_bitmap_complete
+        body:
+          settings:
+            number_of_shards: 1
+          mappings:
+            properties:
+              id:
+                type: long
+
+  - do:
+      bulk:
+        refresh: true
+        index: test_roaring_bitmap_complete
+        body:
+          - '{"index": {}}'
+          - '{"id": 1}'
+          - '{"index": {}}'
+          - '{"id": 2}'
+
+  # A result that read the whole match set says so, so a caller can tell a full set from a short one
+  # without inspecting the bitmap itself.
+  - do:
+      search:
+        index: test_roaring_bitmap_complete
+        body:
+          size: 0
+          track_total_hits: false
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: id
+
+  - is_true: aggregations.ids.value
+  - match: { aggregations.ids.complete: true }
+
+  # An unmapped field returns no bitmap at all, but still reports completeness.
+  - do:
+      search:
+        index: test_roaring_bitmap_complete
+        body:
+          size: 0
+          track_total_hits: false
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: missing_field
+
+  - match: { aggregations.ids.value: null }
+  - match: { aggregations.ids.complete: true }
+
+---
+"roaring_bitmap aggregation reports incomplete when terminate_after is set":
+
+  - do:
+      indices.create:
+        index: test_roaring_bitmap_terminate_after
+        body:
+          settings:
+            number_of_shards: 1
+          mappings:
+            properties:
+              id:
+                type: long
+
+  - do:
+      bulk:
+        refresh: true
+        index: test_roaring_bitmap_terminate_after
+        body:
+          - '{"index": {}}'
+          - '{"id": 1}'
+          - '{"index": {}}'
+          - '{"id": 2}'
+          - '{"index": {}}'
+          - '{"id": 3}'
+          - '{"index": {}}'
+          - '{"id": 4}'
+
+  # terminate_after stops collection from outside the aggregation. The bitmap that comes back holds a
+  # fraction of the matching values and is a perfectly valid bitmap, so the result has to say so.
+  - do:
+      search:
+        index: test_roaring_bitmap_terminate_after
+        body:
+          size: 0
+          track_total_hits: false
+          terminate_after: 1
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: id
+
+  - match: { terminated_early: true }
+  - match: { aggregations.ids.complete: false }
+  - is_true: aggregations.ids.value
+
+  # The same query without terminate_after reads everything and says so.
+  - do:
+      search:
+        index: test_roaring_bitmap_terminate_after
+        body:
+          size: 0
+          track_total_hits: false
+          aggs:
+            ids:
+              roaring_bitmap:
+                field: id
+
+  - match: { aggregations.ids.complete: true }

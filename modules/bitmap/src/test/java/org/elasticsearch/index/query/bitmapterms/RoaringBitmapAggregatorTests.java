@@ -311,6 +311,79 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
         assertThat(exception.getMessage(), containsString("only supports non-negative values"));
     }
 
+    public void testResultIsCompleteWhenNothingStoppedCollection() throws Exception {
+        assertTrue(aggregate(NumberFieldMapper.NumberType.LONG, 1, 2, 3).isComplete());
+    }
+
+    /**
+     * A union is only as complete as its least complete part, so one short shard has to make the whole
+     * result short. Otherwise a caller sees "complete" on a set that is missing an arbitrary slice.
+     */
+    public void testReduceReportsIncompleteIfAnyShardWasIncomplete() throws Exception {
+        InternalRoaringBitmap completeShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1, true);
+        InternalRoaringBitmap partialShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1L << 40, false);
+        AggregationReduceContext reduceContext = new AggregationReduceContext.ForFinal(
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            () -> false,
+            AggregatorFactories.builder(),
+            ignored -> {},
+            null
+        );
+
+        try (AggregatorReducer reducer = completeShard.getReducer(reduceContext, 2)) {
+            reducer.accept(completeShard);
+            reducer.accept(partialShard);
+            assertFalse(((InternalRoaringBitmap) reducer.get()).isComplete());
+        }
+    }
+
+    public void testReduceStaysCompleteWhenEveryShardWasComplete() throws Exception {
+        InternalRoaringBitmap firstShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1, true);
+        InternalRoaringBitmap secondShard = result(InternalRoaringBitmap.BitmapFormat.LONG, 1L << 40, true);
+        AggregationReduceContext reduceContext = new AggregationReduceContext.ForFinal(
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            () -> false,
+            AggregatorFactories.builder(),
+            ignored -> {},
+            null
+        );
+
+        try (AggregatorReducer reducer = firstShard.getReducer(reduceContext, 2)) {
+            reducer.accept(firstShard);
+            reducer.accept(secondShard);
+            assertTrue(((InternalRoaringBitmap) reducer.get()).isComplete());
+        }
+    }
+
+    /**
+     * An unmapped shard contributes no values but still reports whether it finished, so its verdict has
+     * to survive a reduce that produces no bitmap at all.
+     */
+    public void testUnmappedShardStillCarriesItsVerdict() throws Exception {
+        InternalRoaringBitmap partialUnmapped = new InternalRoaringBitmap(
+            "ids",
+            InternalRoaringBitmap.BitmapFormat.UNMAPPED,
+            new byte[0],
+            null,
+            false
+        );
+        AggregationReduceContext reduceContext = new AggregationReduceContext.ForFinal(
+            BigArrays.NON_RECYCLING_INSTANCE,
+            null,
+            () -> false,
+            AggregatorFactories.builder(),
+            ignored -> {},
+            null
+        );
+
+        try (AggregatorReducer reducer = partialUnmapped.getReducer(reduceContext, 1)) {
+            reducer.accept(partialUnmapped);
+            assertFalse(((InternalRoaringBitmap) reducer.get()).isComplete());
+        }
+    }
+
     public void testMultiValuedField() throws Exception {
         MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType(FIELD, NumberFieldMapper.NumberType.LONG);
         try (Directory directory = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), directory)) {
@@ -604,9 +677,13 @@ public class RoaringBitmapAggregatorTests extends AggregatorTestCase {
     }
 
     private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value) throws IOException {
+        return result(width, value, true);
+    }
+
+    private static InternalRoaringBitmap result(InternalRoaringBitmap.BitmapFormat width, long value, boolean complete) throws IOException {
         InternalRoaringBitmap.MutableBitmap bitmap = InternalRoaringBitmap.mutable(width);
         bitmap.add(value);
-        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null);
+        return new InternalRoaringBitmap("ids", width, bitmap.serialize(), null, complete);
     }
 
     private static List<Long> drain(BitmapValues values) throws IOException {
