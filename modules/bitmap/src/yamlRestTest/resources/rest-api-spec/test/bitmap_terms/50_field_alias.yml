@@ -1,0 +1,110 @@
+# A field alias must behave exactly like its target field. The bitmap below is the portable 64-bit
+# Roaring serialization of {1, 3, 5}.
+setup:
+  - do:
+      indices.create:
+        index: test_alias_points
+        body:
+          mappings:
+            properties:
+              company_lid:
+                type: long
+              cid:
+                type: alias
+                path: company_lid
+  - do:
+      indices.create:
+        index: test_alias_terms
+        body:
+          mappings:
+            properties:
+              company_lid:
+                type: long
+                index_terms: true
+              cid:
+                type: alias
+                path: company_lid
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - '{"index": {"_index": "test_alias_points"}}'
+          - '{"company_lid": 1}'
+          - '{"index": {"_index": "test_alias_points"}}'
+          - '{"company_lid": 2}'
+          - '{"index": {"_index": "test_alias_points"}}'
+          - '{"company_lid": 3}'
+          - '{"index": {"_index": "test_alias_points"}}'
+          - '{"company_lid": 4}'
+          - '{"index": {"_index": "test_alias_points"}}'
+          - '{"company_lid": 5}'
+          - '{"index": {"_index": "test_alias_terms"}}'
+          - '{"company_lid": 1}'
+          - '{"index": {"_index": "test_alias_terms"}}'
+          - '{"company_lid": 2}'
+          - '{"index": {"_index": "test_alias_terms"}}'
+          - '{"company_lid": 3}'
+          - '{"index": {"_index": "test_alias_terms"}}'
+          - '{"company_lid": 4}'
+          - '{"index": {"_index": "test_alias_terms"}}'
+          - '{"company_lid": 5}'
+
+---
+"bitmap_terms on an alias of a points-indexed field matches like its target":
+  - do:
+      search:
+        index: test_alias_points
+        body:
+          query:
+            bitmap_terms:
+              field: company_lid
+              value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAwAFAA=="
+  - match: { hits.total.value: 3 }
+
+  - do:
+      search:
+        index: test_alias_points
+        body:
+          query:
+            bitmap_terms:
+              field: cid
+              value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAwAFAA=="
+  - match: { hits.total.value: 3 }
+
+---
+"bitmap_terms on an alias of an index_terms field matches like its target":
+  - do:
+      search:
+        index: test_alias_terms
+        body:
+          query:
+            bitmap_terms:
+              field: cid
+              value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAwAFAA=="
+  - match: { hits.total.value: 3 }
+
+---
+"bitmap_terms on an alias excludes the matching documents under must_not":
+  - do:
+      search:
+        index: test_alias_points
+        body:
+          query:
+            bool:
+              must_not:
+                bitmap_terms:
+                  field: cid
+                  value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAwAFAA=="
+  - match: { hits.total.value: 2 }
+
+  - do:
+      search:
+        index: test_alias_terms
+        body:
+          query:
+            bool:
+              must_not:
+                bitmap_terms:
+                  field: cid
+                  value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAwAFAA=="
+  - match: { hits.total.value: 2 }
