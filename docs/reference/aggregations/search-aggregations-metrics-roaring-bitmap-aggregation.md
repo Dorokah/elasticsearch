@@ -192,11 +192,58 @@ This optimization applies when:
 * The aggregation is at the top level. A single-bucket parent such as `filter` is permitted but reads doc values, because the terms dictionary does not record which documents the parent passed through.
 * The aggregation does not use the `missing` parameter, whose substituted value is not present in the index.
 
+## Retrieve a very large set [roaring-bitmap-aggregation-ranges]
+
+A single request for a very large exact set can trip the request circuit breaker. To retrieve such a set, split the request into disjoint ranges over the aggregated field and combine the resulting bitmaps on the client.
+
+Each value falls in exactly one range, so each window's bitmap is complete for its own range, and the union of all windows is exactly the set a single request would have returned. That holds only if every window reads the same data. On an index that is being written to, open a [point in time](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-open-point-in-time) and run every window against it, so documents indexed or deleted between requests do not make the windows disagree.
+
+```console
+GET product-catalog/_search
+{
+  "size": 0,
+  "query": {
+    "range": {
+      "product_id": {
+        "gte": 1,
+        "lt": 3
+      }
+    }
+  },
+  "aggs": {
+    "product_ids": {
+      "roaring_bitmap": {
+        "field": "product_id"
+      }
+    }
+  }
+}
+```
+% TEST[continued]
+
+The response contains the distinct values `1` and `2`:
+
+```console-result
+{
+  ...
+  "aggregations": {
+    "product_ids": {
+      "value": "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAEAEAAAAAEAAgA="
+    }
+  }
+}
+```
+% TESTRESPONSE[s/\.\.\./"took": $body.took,"timed_out": false,"_shards": $body._shards,"hits": $body.hits,/]
+
+A second request for `"gte": 3, "lt": 6` returns `3`, `4`, and `5`. Together, the two bitmaps hold every product ID.
+
+Because the windows are defined by field value rather than by result order, the split is deterministic, and a partially completed walk can resume from the next unread range. Choose window sizes that keep each request comfortably below the circuit breaker limit.
+
 ## Choosing an aggregation [roaring-bitmap-aggregation-choose]
 
 Use `roaring_bitmap` when you need the exact distinct set of numeric values. Its memory use depends on the number and distribution of values; dense or run-like sets usually compress more efficiently than sparse 64-bit sets.
 
-Memory use and response size depend on the distinct values, not the number of matching documents. Very large exact sets can trip the request circuit breaker and return a `circuit_breaking_exception`. Set the search request's `timeout` when it might scan a very large match set.
+Memory use and response size depend on the distinct values, not the number of matching documents. Very large exact sets can trip the request circuit breaker and return a `circuit_breaking_exception`. To retrieve one, [split the request by value range](#roaring-bitmap-aggregation-ranges). Set the search request's `timeout` when it might scan a very large match set. A request that times out still returns the aggregation, holding only the values collected before the timeout, with `timed_out: true` in the response.
 
 If you only need a count:
 
