@@ -14,8 +14,6 @@ import org.apache.lucene.util.RamUsageEstimator;
 import org.roaringbitmap.longlong.LongIterator;
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
 import java.io.IOException;
 
 /**
@@ -83,15 +81,15 @@ public final class LongBitmap implements BitmapValues {
      */
     public static LongBitmap deserializePortable(byte[] bytes) throws IOException {
         Roaring64NavigableMap bitmap = new Roaring64NavigableMap();
-        ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+        BytesDataInput in = new BytesDataInput(bytes);
         // deserializePortable, never deserialize: the latter dispatches on the class-wide static
         // SERIALIZATION_MODE, which defaults to the legacy layout.
-        bitmap.deserializePortable(new DataInputStream(in));
+        bitmap.deserializePortable(in);
         // The reader stops at the end of the bitmap and ignores anything after it. These bytes come
         // from a search request, so reject leftovers instead of silently accepting bitmap + garbage.
-        if (in.available() != 0) {
+        if (in.remaining() != 0) {
             throw new IllegalArgumentException(
-                "found " + in.available() + " trailing byte(s) after a valid 64-bit RoaringBitmap; the value is malformed"
+                "found " + in.remaining() + " trailing byte(s) after a valid 64-bit RoaringBitmap; the value is malformed"
             );
         }
         return new LongBitmap(bitmap);
