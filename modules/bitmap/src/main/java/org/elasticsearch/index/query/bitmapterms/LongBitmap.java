@@ -11,10 +11,15 @@ package org.elasticsearch.index.query.bitmapterms;
 
 import org.apache.lucene.util.NumericUtils;
 import org.apache.lucene.util.RamUsageEstimator;
+import org.roaringbitmap.RoaringBitmap;
 import org.roaringbitmap.longlong.LongIterator;
 import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.nio.BufferUnderflowException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * This wraps {@link Roaring64NavigableMap} to make a 64-bit roaring bitmap safe to hand to a
@@ -77,9 +82,11 @@ public final class LongBitmap implements BitmapValues {
      * {@code serializePortable}.
      *
      * @throws IOException if the bytes are truncated or are not a valid serialized bitmap
-     * @throws IllegalArgumentException if a valid bitmap is followed by trailing bytes
+     * @throws IllegalArgumentException if a valid bitmap is followed by trailing bytes, or its
+     *     buckets are out of order, repeated, or structurally invalid
      */
     public static LongBitmap deserializePortable(byte[] bytes) throws IOException {
+        validateBuckets(bytes);
         Roaring64NavigableMap bitmap = new Roaring64NavigableMap();
         BytesDataInput in = new BytesDataInput(bytes);
         // deserializePortable, never deserialize: the latter dispatches on the class-wide static
@@ -93,6 +100,63 @@ public final class LongBitmap implements BitmapValues {
             );
         }
         return new LongBitmap(bitmap);
+    }
+
+    /**
+     * Checks each bucket before the reference reader sees the bytes, because it does not.
+     * <p>
+     * The reader keeps whichever bucket it saw last for a key, so a repeated key silently drops the
+     * earlier bucket's values. It also loads an inner bitmap whose containers are out of order, after
+     * which {@link #first()} and {@link #last()} are inverted and the forward-only merge join skips
+     * ids. Either way the query then matches the wrong documents and reports nothing. The 32-bit path
+     * already refuses a malformed inner bitmap through {@link RoaringBitmap#validate()}, so apply the
+     * same check to every bucket here and require the keys to be strictly increasing.
+     * <p>
+     * Keys are compared unsigned, which is the order the portable format writes them in.
+     */
+    private static void validateBuckets(byte[] bytes) throws IOException {
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            long bucketCount = buffer.getLong();
+            int previousKey = 0;
+            for (long i = 0; i < bucketCount; i++) {
+                int key = buffer.getInt();
+                if (i > 0 && Integer.compareUnsigned(key, previousKey) <= 0) {
+                    throw new IllegalArgumentException(
+                        "64-bit RoaringBitmap bucket keys must be strictly increasing, but key ["
+                            + Integer.toUnsignedString(key)
+                            + "] follows ["
+                            + Integer.toUnsignedString(previousKey)
+                            + "]"
+                    );
+                }
+                RoaringBitmap inner = new RoaringBitmap();
+                try {
+                    // Reads from the buffer's position without moving it, so step past it by its size.
+                    inner.deserialize(buffer);
+                    buffer.position(buffer.position() + inner.serializedSizeInBytes());
+                } catch (IllegalArgumentException | BufferUnderflowException | IndexOutOfBoundsException e) {
+                    // Past the end of the bytes the reader reports a bad buffer position rather than an
+                    // EOF. Scoped to the read so the structural rejections below keep their own messages.
+                    throw truncated(e);
+                }
+                // validate() reports its verdict by return value rather than by throwing.
+                if (inner.validate() == false) {
+                    throw new IllegalArgumentException(
+                        "the internal structure of 64-bit RoaringBitmap bucket [" + Integer.toUnsignedString(key) + "] is not valid"
+                    );
+                }
+                previousKey = key;
+            }
+        } catch (BufferUnderflowException e) {
+            throw truncated(e);
+        }
+    }
+
+    private static EOFException truncated(RuntimeException cause) {
+        EOFException eof = new EOFException("truncated 64-bit RoaringBitmap");
+        eof.initCause(cause);
+        return eof;
     }
 
     /** Builds a bitmap holding {@code values}. */

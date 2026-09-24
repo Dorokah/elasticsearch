@@ -196,3 +196,27 @@
             bitmap_terms:
               field: big
               value: "AwAAAAAAAADoAAAAOjAAAAEAAACl1AAAEAAAAAEQ0QEAADowAAABAAAASqkAABAAAAACILoCAAA6MAAAAQAAAO99AAAQAAAAAzD///8="
+
+  # A 64-bit bitmap that repeats a bucket key. Read as-is it would keep only the second bucket, {5},
+  # silently dropping {1, 2, 3}.
+  - do:
+      catch: bad_request
+      search:
+        index: test_bitmap_validation
+        body:
+          query:
+            bitmap_terms:
+              field: big
+              value: "AgAAAAAAAAAAAAAAOjAAAAEAAAAAAAIAEAAAAAEAAgADAAAAAAA6MAAAAQAAAAAAAAAQAAAABQA="
+
+  # A 64-bit bitmap whose inner array container holds 10 and then 5, out of order. The same payload
+  # as a 32-bit bitmap is already rejected.
+  - do:
+      catch: bad_request
+      search:
+        index: test_bitmap_validation
+        body:
+          query:
+            bitmap_terms:
+              field: big
+              value: "AQAAAAAAAAAAAAAAOjAAAAEAAAAAAAEAEAAAAAoABQA="
