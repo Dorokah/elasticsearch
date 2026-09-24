@@ -171,11 +171,12 @@ public class BitmapTermsQueryBuilder extends LeafQueryBuilder<BitmapTermsQueryBu
             default -> throw new AssertionError("unexpected number type [" + numberFieldType.numberType() + "]");
         };
         // The two queries differ only in which index structure they merge against; the field's width
-        // is carried by the BitmapValues.
+        // is carried by the BitmapValues. Both are built on the resolved field name: for a field alias,
+        // fieldName is the alias, which has no points, terms or doc values of its own.
         if (numberFieldType.isIndexedWithTerms()) {
-            return new BitmapTermsQuery(fieldName, values);
+            return new BitmapTermsQuery(numberFieldType.name(), values);
         }
-        return new BitmapBKDQuery(fieldName, values);
+        return new BitmapBKDQuery(numberFieldType.name(), values);
     }
 
     private static IntBitmap integerValues(byte[] bitmapBytes) {

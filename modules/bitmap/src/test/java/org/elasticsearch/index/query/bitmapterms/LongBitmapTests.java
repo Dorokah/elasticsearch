@@ -16,6 +16,8 @@ import org.roaringbitmap.longlong.Roaring64NavigableMap;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -56,6 +58,13 @@ public class LongBitmapTests extends ESTestCase {
             }
         }
         return bytes.toByteArray();
+    }
+
+    /** Wraps an already-serialized 32-bit bitmap in the portable 64-bit envelope as its only bucket. */
+    private static byte[] portableEnvelope(int highKey, byte[] innerBitmap) {
+        ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES + Integer.BYTES + innerBitmap.length).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putLong(1).putInt(highKey).put(innerBitmap);
+        return buffer.array();
     }
 
     private static List<Long> drain(LongBitmap.PeekableIterator iterator) {
@@ -123,6 +132,53 @@ public class LongBitmapTests extends ESTestCase {
      * even though it is a negative signed long. The merge-scan queries compare against signed
      * values from the index, so they must be able to detect this and refuse.
      */
+    /**
+     * The reference reader keeps whichever bucket it saw last for a key, so a repeated key silently
+     * drops every value of the earlier bucket and the query matches the wrong documents.
+     */
+    public void testRepeatedBucketKeyRejected() throws IOException {
+        byte[] bytes = portableBytes(
+            new int[] { 0, 0 },
+            new RoaringBitmap[] { RoaringBitmap.bitmapOf(1, 2, 3), RoaringBitmap.bitmapOf(5) }
+        );
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> LongBitmap.deserializePortable(bytes));
+        assertThat(e.getMessage(), containsString("strictly increasing"));
+    }
+
+    public void testBucketKeysOutOfOrderRejected() throws IOException {
+        byte[] bytes = portableBytes(new int[] { 1, 0 }, new RoaringBitmap[] { RoaringBitmap.bitmapOf(5), RoaringBitmap.bitmapOf(1) });
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> LongBitmap.deserializePortable(bytes));
+        assertThat(e.getMessage(), containsString("strictly increasing"));
+    }
+
+    /**
+     * An inner bitmap whose values are out of order is refused by the 32-bit path but loaded as-is by
+     * the 64-bit one, after which first() and last() are inverted and the forward-only merge skips ids.
+     */
+    public void testInvalidInnerBitmapRejected() throws IOException {
+        // No-run cookie, one array container under key 0, holding 10 and then 5.
+        byte[] unsortedInner = { 0x3A, 0x30, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 16, 0, 0, 0, 10, 0, 5, 0 };
+        expectThrows(IllegalArgumentException.class, () -> IntBitmap.deserialize(unsortedInner));
+
+        byte[] bytes = portableEnvelope(0, unsortedInner);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> LongBitmap.deserializePortable(bytes));
+        assertThat(e.getMessage(), containsString("not valid"));
+    }
+
+    /**
+     * Buckets are ordered by their high 32 bits as unsigned values, so a key with its sign bit set
+     * legitimately follows one without. A signed comparison would reject this valid input.
+     */
+    public void testBucketKeysAreComparedUnsigned() throws IOException {
+        long below = (0x7FFFFFFFL << 32) | 1;
+        long above = (0x80000000L << 32) | 1;
+
+        LongBitmap bitmap = LongBitmap.deserializePortable(serializePortable(below, above));
+        assertThat(drain(bitmap.iterator()), equalTo(List.of(below, above)));
+    }
+
     public void testHasNegativeValues() throws IOException {
         LongBitmap negative = LongBitmap.deserializePortable(serializePortable(5L, -1L));
         assertThat(negative.hasNegativeValues(), equalTo(true));
